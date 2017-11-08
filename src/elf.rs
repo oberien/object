@@ -1,6 +1,7 @@
 use std::slice;
 
-use goblin::elf;
+use goblin::elf::{self, Syms};
+use goblin::strtab::Strtab;
 
 use {Machine, Object, ObjectSection, ObjectSegment, SectionKind, Symbol, SymbolKind};
 
@@ -45,6 +46,66 @@ impl<'a> ElfFile<'a> {
     #[inline]
     pub fn elf(&self) -> &elf::Elf<'a> {
         &self.elf
+    }
+
+    fn symbols_from(&self, symbol_table: &Syms, string_table: &Strtab<'a>) -> Vec<Symbol<'a>> {
+        // Determine section kinds.
+        // The section kinds are inherited by symbols in those sections.
+        let mut section_kinds = Vec::new();
+        for sh in &self.elf.section_headers {
+            let kind = match sh.sh_type {
+                elf::section_header::SHT_PROGBITS => {
+                    if sh.sh_flags & u64::from(elf::section_header::SHF_EXECINSTR) != 0 {
+                        SectionKind::Text
+                    } else if sh.sh_flags & u64::from(elf::section_header::SHF_WRITE) != 0 {
+                        SectionKind::Data
+                    } else {
+                        SectionKind::ReadOnlyData
+                    }
+                }
+                elf::section_header::SHT_NOBITS => SectionKind::UninitializedData,
+                _ => SectionKind::Unknown,
+            };
+            section_kinds.push(kind);
+        }
+
+        let mut symbols = Vec::new();
+        // Skip undefined symbol index.
+        for sym in symbol_table.iter().skip(1) {
+            let kind = match elf::sym::st_type(sym.st_info) {
+                elf::sym::STT_OBJECT => SymbolKind::Data,
+                elf::sym::STT_FUNC => SymbolKind::Text,
+                elf::sym::STT_SECTION => SymbolKind::Section,
+                elf::sym::STT_FILE => SymbolKind::File,
+                elf::sym::STT_COMMON => SymbolKind::Common,
+                elf::sym::STT_TLS => SymbolKind::Tls,
+                _ => SymbolKind::Unknown,
+            };
+            let global = elf::sym::st_bind(sym.st_info) != elf::sym::STB_LOCAL;
+            let section_kind = if sym.st_shndx == elf::section_header::SHN_UNDEF as usize
+                || sym.st_shndx >= section_kinds.len()
+            {
+                None
+            } else {
+                Some(section_kinds[sym.st_shndx])
+            };
+            let name = string_table.get(sym.st_name).and_then(Result::ok);
+            symbols.push(Symbol {
+                kind,
+                section: sym.st_shndx,
+                section_kind,
+                global,
+                name,
+                address: sym.st_value,
+                size: sym.st_size,
+            });
+        }
+        symbols
+    }
+
+    /// Returns dynamic symbols
+    pub fn dynamic_symbols(&self) -> Vec<Symbol<'a>> {
+        self.symbols_from(&self.elf.dynsyms, &self.elf.dynstrtab)
     }
 }
 
@@ -95,58 +156,7 @@ impl<'a> Object<'a> for ElfFile<'a> {
     }
 
     fn symbols(&self) -> Vec<Symbol<'a>> {
-        // Determine section kinds.
-        // The section kinds are inherited by symbols in those sections.
-        let mut section_kinds = Vec::new();
-        for sh in &self.elf.section_headers {
-            let kind = match sh.sh_type {
-                elf::section_header::SHT_PROGBITS => {
-                    if sh.sh_flags & u64::from(elf::section_header::SHF_EXECINSTR) != 0 {
-                        SectionKind::Text
-                    } else if sh.sh_flags & u64::from(elf::section_header::SHF_WRITE) != 0 {
-                        SectionKind::Data
-                    } else {
-                        SectionKind::ReadOnlyData
-                    }
-                }
-                elf::section_header::SHT_NOBITS => SectionKind::UninitializedData,
-                _ => SectionKind::Unknown,
-            };
-            section_kinds.push(kind);
-        }
-
-        let mut symbols = Vec::new();
-        // Skip undefined symbol index.
-        for sym in self.elf.syms.iter().skip(1) {
-            let kind = match elf::sym::st_type(sym.st_info) {
-                elf::sym::STT_OBJECT => SymbolKind::Data,
-                elf::sym::STT_FUNC => SymbolKind::Text,
-                elf::sym::STT_SECTION => SymbolKind::Section,
-                elf::sym::STT_FILE => SymbolKind::File,
-                elf::sym::STT_COMMON => SymbolKind::Common,
-                elf::sym::STT_TLS => SymbolKind::Tls,
-                _ => SymbolKind::Unknown,
-            };
-            let global = elf::sym::st_bind(sym.st_info) != elf::sym::STB_LOCAL;
-            let section_kind = if sym.st_shndx == elf::section_header::SHN_UNDEF as usize
-                || sym.st_shndx >= section_kinds.len()
-            {
-                None
-            } else {
-                Some(section_kinds[sym.st_shndx])
-            };
-            let name = self.elf.strtab.get(sym.st_name).and_then(Result::ok);
-            symbols.push(Symbol {
-                kind,
-                section: sym.st_shndx,
-                section_kind,
-                global,
-                name,
-                address: sym.st_value,
-                size: sym.st_size,
-            });
-        }
-        symbols
+        self.symbols_from(&self.elf.syms, &self.elf.strtab)
     }
 
     #[inline]
